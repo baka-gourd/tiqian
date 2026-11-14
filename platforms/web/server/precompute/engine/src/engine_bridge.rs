@@ -70,6 +70,7 @@ use crate::session::{CaptureEvidence, FontSession, MetricsInput, ShapeInput};
 struct SessionBackend {
     session: *const FontSession,
     evidence: *mut CaptureEvidence,
+    numeric_spans: std::sync::Arc<[crate::numeric::NumericSpan]>,
 }
 
 // SAFETY: the raw pointers target data that outlives the engine call (see
@@ -84,10 +85,11 @@ impl SessionBackend {
     /// Both pointers must stay valid, and the pointees exclusively owned by
     /// this call, for as long as the built engine lives.
     /// `precompute_paragraph` guarantees both.
-    unsafe fn new(session: &FontSession, evidence: &mut CaptureEvidence) -> Self {
+    unsafe fn new(session: &FontSession, evidence: &mut CaptureEvidence, numeric_spans: &[crate::numeric::NumericSpan]) -> Self {
         Self {
             session: std::ptr::from_ref(session),
             evidence: std::ptr::from_mut(evidence),
+            numeric_spans: std::sync::Arc::from(numeric_spans),
         }
     }
 
@@ -119,6 +121,9 @@ impl SessionBackend {
                 .collect();
             let locale = input.style.locale.to_utf8_lossy();
             let source_text = utf16_substring(&text, input.range.start, input.range.end);
+            let numeric = self.numeric_spans.iter().rev().find(|span| {
+                span.start <= input.range.start && input.range.end <= span.end
+            });
             let input = ShapeInput {
                 display_text: &display_text,
                 font_families: &font_families,
@@ -130,7 +135,7 @@ impl SessionBackend {
                 source_text: Some(&source_text),
             };
             session
-                .shape_into(evidence, &input)
+                .shape_with_numeric_into(evidence, &input, numeric.map(|span| span.features.as_slice()))
                 .map(|record| (record, source_text))
         })?;
         let (record, source_text) = shaped;
@@ -257,6 +262,7 @@ impl ITextShaper for SessionBackend {
         Box::new(SessionBackend {
             session: self.session,
             evidence: self.evidence,
+            numeric_spans: self.numeric_spans.clone(),
         })
     }
     fn shape(&mut self, input: ShapingInput) -> Result<ShapingResult, TextShaperShapeFault> {
@@ -277,6 +283,7 @@ impl FontMetricsResolver for SessionBackend {
         Box::new(SessionBackend {
             session: self.session,
             evidence: self.evidence,
+            numeric_spans: self.numeric_spans.clone(),
         })
     }
     fn resolve(&self, request: FontMetricsRequest) -> Result<RawFontMetrics, TextRangeError> {
@@ -419,6 +426,16 @@ pub fn precompute_paragraph(
     evidence: &mut CaptureEvidence,
     request: &ParagraphRequest,
 ) -> Result<crate::plan::Plan, String> {
+    precompute_paragraph_with_numeric_spans(session, evidence, request, &[])
+}
+
+/// Run a paragraph with validated numeric overrides on its source ranges.
+pub(crate) fn precompute_paragraph_with_numeric_spans(
+    session: &FontSession,
+    evidence: &mut CaptureEvidence,
+    request: &ParagraphRequest,
+    numeric_spans: &[crate::numeric::NumericSpan],
+) -> Result<crate::plan::Plan, String> {
     request.validate().map_err(|error| error.0)?;
     // SAFETY: `precompute_paragraph` holds both borrows across the engine
     // call; see the obligation list on `SessionBackend`.
@@ -427,9 +444,9 @@ pub fn precompute_paragraph(
         // `Arc<Mutex<dyn ITextShaper>>`; the metrics resolver stays a
         // plain `Box`. Both point at the same session and capture window.
         text_shaper: Some(std::sync::Arc::new(std::sync::Mutex::new(unsafe {
-            SessionBackend::new(session, evidence)
+            SessionBackend::new(session, evidence, numeric_spans)
         }))),
-        font_metrics_resolver: Some(Box::new(unsafe { SessionBackend::new(session, evidence) })),
+        font_metrics_resolver: Some(Box::new(unsafe { SessionBackend::new(session, evidence, numeric_spans) })),
         ..EngineComponents::default()
     })
     .map_err(|error| error.0)?;
